@@ -189,6 +189,32 @@
 
 根据坡度标记可行走三角形
 
+是导航网格生成流程中的第一个**关键预处理函数**，其核心作用是：根据三角形的坡度角度，标记哪些三角形是可行走的，并且为后续的 `rcRasterizeTriangles` 提供每个三角形的区域表示 (Area ID)
+
+```cpp
+void rcMarkWalkableTriangles(
+    rcContext* context,           // 上下文（用于日志/计时）
+    const float walkableSlopeAngle,  // 可行走的最大坡度角（度）
+    const float* verts,           // 顶点数组 [x0,y0,z0, x1,y1,z1, ...]
+    const int numVerts,           // 顶点数量
+    const int* tris,              // 三角形索引数组 [t0_v0, t0_v1, t0_v2, t1_v0, ...]
+    const int numTris,            // 三角形数量
+    unsigned char* triAreaIDs     // 输出：每个三角形的区域ID
+);
+```
+
+核心思想就是：判断一个三角面的法向量与世界向上方向（Y轴）的夹角
+- 如果夹角 小于 `walkableSlopeAngle`，则该三角形是可行走的
+- 如果夹角 大于等于 `walkableSlopeAngle`，则意味着该面是墙壁/悬崖，是不可行走的 
+
+设三角形的法向量是 N = (Nx, Ny, Nz), 世界向上方向为 U = (0, 1, 0)，那么 N · U = cos(θ) = Nx * 0 + Ny * 1 + Nz * 0 = Ny
+
+所以 cos(θ) = Ny
+
+由于 cos 在 0 ~ 180 是单调递减的，所以 θ < `walkableSlopeAngle` 可以转换为 `cos(θ)` > `cos(walkableSlopeAngle)`，也就是 `Ny` > `cos(walkableSlopeAngle)`
+
+
+
 ### rcRasterizeTriangles
 
 将三角形栅格化为体素
