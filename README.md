@@ -63,7 +63,7 @@
 | --- | --- |
 | walkableSlopAngle | 最大可行走的坡度角度 |
 | walkeableHeight | 角色可通过的最小高度，比如低矮的管道，玩家无法通过 |
-| walkableClim | 角色能跨越的最大台阶高度 |
+| walkableClimb | 角色能跨越的最大台阶高度 |
 | walkeableRadius | 角色半径，用于定义网格边缘的收缩量，Recast 会将可行走的区域从墙壁向内收缩这个距离，保证 Agent 的中心点贴着网格边缘走时，身体不会穿模 |
 
 - 区域与轮廓生成，控制如何将体素转化为多边形，影响网格的复杂度和拓扑
@@ -213,31 +213,401 @@ void rcMarkWalkableTriangles(
 
 由于 cos 在 0 ~ 180 是单调递减的，所以 θ < `walkableSlopeAngle` 可以转换为 `cos(θ)` > `cos(walkableSlopeAngle)`，也就是 `Ny` > `cos(walkableSlopeAngle)`
 
+```cpp
+const float walkableThr = cosf(walkableSlopeAngle / 180.0f * RC_PI);
 
+for (int i = 0; i < numTris; ++i)
+{
+    const int* tri = &tris[i * 3];
+    // calcTriNormal 计算法线向量 
+    calcTriNormal(&verts[tri[0] * 3], &verts[tri[1] * 3], &verts[tri[2] * 3], norm);
+    if (norm[1] > walkableThr)
+    {
+        // 标记序号为 i 的三角形为可行走
+        triAreaIDs[i] = RC_WALKABLE_AREA;
+    }
+}
+```
+
+> `calcTriNormal` 的计算比较简单，就是根据传入的三个点，计算两个向量，叉乘得到法线，然后归一化处理即可
 
 ### rcRasterizeTriangles
 
 将三角形栅格化为体素
 
+为什么需要将三角形体素化？
+
+游戏中的 3D 场景由任意形状的 **三角形网格** 组成，可能重叠、有缝隙、有不规则的拓扑结构，如果直接在上面做路径规划非常复杂
+
+体素化的目的就是为了将不规则变化为规则的网格、简单的邻接关系、便于分析，更方便的处理重叠、缝隙等几何问题
+
+```cpp
+bool rcRasterizeTriangles(
+    rcContext* context,           // 上下文（日志/计时）
+    const float* verts,           // 顶点数组 [x0,y0,z0, x1,y1,z1, ...]
+    const int nv,                 // 顶点数量（未使用）
+    const int* tris,              // 三角形索引数组
+    const unsigned char* triAreaIDs, // 每个三角形的区域ID（来自 rcMarkWalkableTriangles）
+    const int numTris,            // 三角形数量
+    rcHeightfield& heightfield,   // 输出：高度场
+    const int flagMergeThreshold  // Span 合并阈值（通常是 walkableClimb）
+);
+```
+
+关于 `rcHeightfield` 用于存储高度场
+
+```cpp
+struct rcHeightfield {
+    int width;          // X 方向单元格数量
+    int height;         // Z 方向单元格数量
+    float bmin[3];      // 包围盒最小点
+    float bmax[3];      // 包围盒最大点
+    float cs;           // Cell Size (XZ平面单元格大小)
+    float ch;           // Cell Height (Y方向单元格高度)
+    rcSpan** spans;     // 二维数组，每个单元格的 Span 链表
+};
+
+struct rcSpan {
+    unsigned int smin : 13;  // Span 底部高度索引
+    unsigned int smax : 13;  // Span 顶部高度索引
+    unsigned int area : 6;   // 区域类型 ID
+    rcSpan* next;            // 同一列中下一个 Span
+};
+```
+
+一个 (x, z) 单元格可以有多个垂直方向的 Span
+
+> 垂直地面的轴是 y 轴，别忘了
+
+```cpp
+      Y (高度)
+      │
+      │    ┌───┐ Span 2 (smin=8, smax=10, area=1)
+      │    └───┘
+      │
+      │    ┌───┐ Span 1 (smin=3, smax=5, area=1)
+      │    └───┘
+      │
+      │    ┌───┐ Span 0 (smin=0, smax=2, area=1)
+      ├────┴───┴────────► X
+     ╱
+    Z
+
+    一个 (x,z) 单元格可以有多个垂直方向的 Span
+    （用于表示多层结构，如桥梁下方的道路）
+```
+
+真正实现体素化的函数是 `rasterizeTri`，该函数接收三角形的三个顶点坐标
+
+1. 通过 AABB 包围盒检查，快速剔除不在高度场中的 三角形
+2. 沿 Z 轴切片，然后言责 X 轴切片，将三角形切片成多个小块
+3. 对于落入诶个单元格的多边形片段，计算其 Y 坐标范围
+4. 通过 addSpan 添加并合并到 Span
+
+> 通过 Sutherland-Hodgman 多边形裁剪算法，对三角形进行切割
+
+```
+合并前：                           合并后：
+         │                                │
+         │   ┌───┐ 新 Span                │   ┌───┐
+         │   └───┘                        │   │   │
+         │   ┌───┐ 旧 Span 1     ──►      │   │   │ 合并后的 Span
+         │   └───┘                        │   │   │
+         │   ┌───┐ 旧 Span 2              │   └───┘
+         │   └───┘                        │
+         └──────────                      └──────────
+
+三个重叠的 Span 被合并成一个大 Span
+```
+
+```cpp
+static bool rasterizeTri(
+    const float* v0, const float* v1, const float* v2,  // 三角形三个顶点
+    const unsigned char areaID,           // 区域标识
+    rcHeightfield& heightfield,           // 输出高度场
+    const float* heightfieldBBMin,        // 高度场包围盒最小点
+    const float* heightfieldBBMax,        // 高度场包围盒最大点
+    const float cellSize,                 // 单元格大小 (XZ平面)
+    const float inverseCellSize,          // 1.0 / cellSize
+    const float inverseCellHeight,        // 1.0 / cellHeight
+    const int flagMergeThreshold          // Span合并阈值
+);
+```
+
+核心思路是将三角形逐步裁剪成与网格单元格对其的小多边形片段，具体的裁剪是通过 `dividePoly` 计算得到的
+
+```cpp
+static void dividePoly(
+    const float* inVerts, int inVertsCount,    // 输入多边形
+    float* outVerts1, int* outVerts1Count,     // 输出：分割线一侧的多边形
+    float* outVerts2, int* outVerts2Count,     // 输出：分割线另一侧的多边形
+    float axisOffset,                          // 分割线位置
+    rcAxis axis                                // 分割轴 (X, Y, 或 Z)
+);
+```
+
+大概示意图如下
+
+```
+         Z 轴
+         │
+         │      A (z=3)
+      3 ─┼─────╱╲
+         │    ╱  ╲
+  分割线 ──┼───P────Q───  z = 2.0 (axisOffset)
+      2 ─┼  ╱      ╲
+         │ ╱        ╲
+      1 ─┼B──────────C (z=1)
+         │
+         └─────────────► X 轴
+
+原始三角形: A(z=3), B(z=1), C(z=1)
+
+dividePoly 输出:
+├── outVerts1 (z >= 2): [A, P, Q]     ← 分割线上方
+└── outVerts2 (z < 2):  [P, B, C, Q]  ← 分割线下方
+
+P, Q 是分割线与三角形边的交点
+```
+
 ### rcFilterLowHangingWalkableObstacles
 
-过滤低悬障碍物（台阶、路缘）
+该函数主要是为了处理当一个较薄的障碍物（如路缘石、台阶、小石头）位于可行走地面上方且高度在 walkableClimb 范围内时，应该将这个障碍物的顶面也标记为可行走
+
+```
+场景1: 台阶/路缘石
+                          
+    ┌───────┐             
+    │ 障碍物 │ ← 被标记为不可行走 (因为坡度太陡)
+    └───────┘             
+════════════════ ← 地面 (可行走)
+
+问题: 如果 Agent 可以"踏上"这个低矮障碍物，
+      它应该被标记为可行走！
+```
+
+```
+场景2: 体素化后的高度场视图
+
+    Y (高度)
+    │
+  5 ├─────────
+    │   ┌───┐ Span B (smax=4, area=NULL) ← 不可行走的障碍物顶面
+  4 ├───┤   │
+    │   └───┘
+  3 ├─────────
+    │   ┌───┐ Span A (smax=2, area=WALKABLE) ← 可行走的地面
+  2 ├───┤   │
+    │   └───┘
+  1 ├─────────
+    └─────────► (x, z) 单元格
+
+如果 Span B 的顶部 (smax=4) 与 Span A 的顶部 (smax=2) 差值 <= walkableClimb,
+那么 Agent 应该能"爬上去"，所以 Span B 也应该标记为可行走！
+```
+
+函数参数如下
+
+```cpp
+void rcFilterLowHangingWalkableObstacles(
+    rcContext* context,       // 上下文
+    const int walkableClimb,  // 最大可攀爬高度 (单位: 体素格)
+    rcHeightfield& heightfield // 高度场
+);
+```
+
+遍历所有的单元格，对单元格的 Span 进行遍历，如果当前 Span 不可行走，但是下方的 Span 可行走，并且高度差小于等于 walkableClimb ，那么标记当前 Span 为可行走
+
+```cpp
+if (!walkable && previousWasWalkable && (int)span->smax - (int)previousSpan->smax <= walkableClimb)
+{
+    span->area = previousAreaID;
+}
+
+// 保留原始值
+previousWasWalkable = walkable;
+previousAreaID = span->area;
+```
+
+为什么这里要保存 previousWasWalkable 原始值？是为了防止错误传播，针对的就是下面这种情况
+
+```
+错误情况（如果用修改后的值）:
+
+    │   ┌───┐ Span C (area=NULL)
+  6 ├───┤   │
+    │   └───┘
+    │   ┌───┐ Span B (area=NULL → WALKABLE)
+  4 ├───┤   │
+    │   └───┘
+    │   ┌───┐ Span A (area=WALKABLE)
+  2 ├───┤   │
+
+处理 Span B: A 可行走 + 高度差=2 ≤ walkableClimb → B 变可行走 ✓
+处理 Span C: 如果用修改后的 B(可行走) → C 也会变可行走 ✗ (错误!)
+
+正确做法：使用 B 的原始状态（不可行走），C 不会被错误标记
+```
 
 ### rcFilterLedgeSpans
 
-过滤悬崖边缘
+过滤悬崖边缘，将靠近悬崖/陡坡边缘的 Span 标记为不可行走
+
+即使一个 Span 的表面本身是平坦可行走的，如果它的邻居存在大的高度落差（悬崖），Agent 站在这里会有掉落风险，因此应标记为不可行走
+
+```cpp
+void rcFilterLedgeSpans(
+    rcContext* context,
+    const int walkableHeight,  // Agent 身高 (单位: 体素格)
+    const int walkableClimb,   // 最大可攀爬高度 (单位: 体素格)
+    rcHeightfield& heightfield
+);
+```
+
+- 判断悬崖的三种情况
+  - 邻居在网格边界外
+  - 邻居完全空旷
+  - 邻居地面高度差过大
+- 陡坡检测
+  - 左右邻居可达，但是左右邻居之前的高度差超过阈值
+
+做 悬崖 和 陡坡 检测，主要是为了 安全性 和 真实性
+
+当 Agent 通过 导航网格 移动时，如果途径悬崖可能会掉落，如果提前过滤掉悬崖附近的网格，Agent 移动过程更加安全，不存在掉落悬崖的风险
 
 ### rcFilterWalkableLowHeightSpans
 
-过滤低净空区域
+将头顶空间不足的 Span 标记为不可行走
+
+即使一个 Span 的地面是平坦的、不在悬崖边缘，如果它上方的空间不足以让 Agent 站立，那么它也不应该被标记为可行走
+
+```cpp
+void rcFilterWalkableLowHeightSpans(
+    rcContext* context,
+    const int walkableHeight,  // Agent 身高 (单位: 体素格数)
+    rcHeightfield& heightfield
+);
+```
+
+```
+    Y 轴 (高度)
+    │
+    │   ┌─────────────┐ ← 上方 Span (span->next)
+    │   │  障碍物     │
+    │   │             │
+    │   └─────────────┘ ← span->next->smin = ceiling
+    │                     
+    │         ↕ 头顶空间 (ceiling - floor)
+    │                     
+    │   ╔═════════════╗ ← span->smax = floor
+    │   ║  当前 Span   ║
+    │   ║             ║
+    │   ╚═════════════╝ ← span->smin
+    │
+    └─────────────────────►
+
+floor   = span->smax        (Agent 脚踩的地面高度)
+ceiling = span->next->smin  (头顶障碍物的底部高度)
+头顶空间 = ceiling - floor
+```
+
+所以代码的判断逻辑很简单
+
+```cpp
+const int floor = (int)(span->smax);
+const int ceiling = span->next ? (int)(span->next->smin) : MAX_HEIGHTFIELD_HEIGHT;
+if (ceiling - floor < walkableHeight)
+{
+    span->area = RC_NULL_AREA;  // 空间不足，不可行走
+}
+```
 
 ### rcBuildCompactHeightfield
 
-构建紧凑高度场
+将稀疏的链表式高度场（rcHeightfield）转换为紧凑的数组式高度场（rcCompactHeightfield），并建立邻接关系
+
+稀疏链表式高度场存在一些问题
+
+1. 链表遍历效率低
+2. 内存分散
+3. 无法直接索引第 N 个 Span
+4. 没有邻接信息
+
+紧凑数组式高度场的优势
+
+1. 数组顺序访问，缓存友好
+2. 内存连续，效率高
+3. 可以直接索引任意 Span
+4. 内置临界关系，方便后续区域划分
+
+```cpp
+// 紧凑高度场
+struct rcCompactHeightfield {
+    rcCompactCell* cells;    // 单元格数组
+    rcCompactSpan* spans;    // Span 数组（连续存储）
+    unsigned char* areas;    // 区域 ID 数组
+    // ...
+};
+
+struct rcCompactCell {
+    unsigned int index : 24;  // 该单元格第一个 Span 在 spans 数组中的索引
+    unsigned int count : 8;   // 该单元格的 Span 数量
+};
+
+struct rcCompactSpan {
+    unsigned short y;         // Span 底部高度
+    unsigned char h;          // Span 高度（头顶空间）
+    unsigned int con : 24;    // 4个方向的邻接信息 (每个6位)
+};
+```
+
+`rcBuildCompactHeightfield` 函数定义如下
+
+```cpp
+bool rcBuildCompactHeightfield(
+    rcContext* context,
+    const int walkableHeight,  // Agent 身高 (体素格)
+    const int walkableClimb,   // 最大可攀爬高度 (体素格)
+    const rcHeightfield& heightfield,       // 输入: 原始高度场
+    rcCompactHeightfield& compactHeightfield // 输出: 紧凑高度场
+);
+```
+
+从 稀疏链表式高度场 转化为 紧凑数组式高度场 分为两步
+
+1. 统计与复制 Span
+2. 建立邻接关系
+
+每个 rcCompactSpan 有一个 24 位的 con 字段，存储 4 个方向的邻接信息，每个方向 6 位
+
+> `RC_NOT_CONNECTED` 值为 63，表示不连接；其他 0 ~ 62 记录邻居单元格中 Span 的索引 
+
+两个单元格之间可以建立连接需要满足
+
+1. 有足够的通行距离
+2. 高度差可攀爬
 
 ### rcErodeWalkableArea
 
 收缩可行走区域（按智能体半径）
+
+将可行走区域向内收缩（腐蚀），以便为 Agent 的半径预留空间
+
+这是一个形态学腐蚀操作，确保生成的导航网格与障碍物之间保持 Agent 半径的安全距离。
+
+```cpp
+bool rcErodeWalkableArea(
+    rcContext* context,
+    const int erosionRadius,                    // 腐蚀半径 (通常 = Agent 半径 / cellSize)
+    rcCompactHeightfield& compactHeightfield    // 输入/输出: 紧凑高度场
+);
+```
+
+计算过程分为 3 步
+
+1. 标记边界，遍历所有的 Span
+2. 计算距离场
+3. 应用腐蚀
 
 ### rcMarkConvexPolyArea
 
